@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EC2 Rightsizing Dashboard • Mario Mora</title>
+  <meta name="description" content="Daily EC2 rightsizing recommendations pulled from Cost Explorer, stored in S3, and rendered as a live table." />
+  <style>
+    :root {
+      --bg:#0b1220; --text:#e6e9f0; --muted:#a6b0cf;
+      --brand:#FFD966; --card:rgba(255,255,255,.04); --border:rgba(255,255,255,.08);
+    }
+    *{box-sizing:border-box}
+    body{margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;
+         background:var(--bg); color:var(--text); line-height:1.6; padding:24px}
+    a{color:var(--brand); text-decoration:none}
+    a:hover{opacity:.9}
+    h1{font-size:28px; margin:0 0 8px 0}
+    .muted{color:var(--muted); font-size:14px}
+    .wrap{max-width:1100px; margin:0 auto}
+    .header{display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px}
+    .pill{display:inline-block; padding:3px 8px; border-radius:999px; background:rgba(255,217,102,.2);
+          color:#FFD966; font-size:12px; font-weight:600}
+    .panel{border:1px solid var(--border); background:var(--card); border-radius:14px;
+           padding:14px; margin-top:14px}
+    table{width:100%; border-collapse:collapse; margin-top:12px; background:var(--card);
+          border:1px solid var(--border); border-radius:12px; overflow:hidden}
+    th,td{padding:10px 14px; border-bottom:1px solid var(--border); text-align:left; font-size:14px}
+    th{background:rgba(255,255,255,.05); font-weight:600}
+    tr:hover{background:rgba(255,255,255,.03)}
+    .footer{margin-top:16px; color:var(--muted); font-size:12px}
+    @media (max-width:700px){
+      th:nth-child(4), td:nth-child(4), th:nth-child(7), td:nth-child(7){display:none}
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <h1>EC2 Rightsizing Dashboard</h1>
+      <a href="/" aria-label="Back to portfolio">← Back to Portfolio</a>
+    </div>
+    <div class="muted">Updated daily by AWS Lambda + Cost Explorer • Served via CloudFront</div>
+
+    <div class="panel">
+      <strong>Status:</strong> <span id="status" class="muted">Loading data…</span>
+      <div style="margin-top:8px">
+        <span class="pill" id="count">0 items</span>
+        <span class="pill" id="total">Total savings: $0.00/mo</span>
+      </div>
+    </div>
+
+    <table id="t">
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Name</th>
+          <th>Instance ID</th>
+          <th>AZ</th>
+          <th>Current Type</th>
+          <th>Recommended</th>
+          <th>State</th>
+          <th>Monthly Savings (USD)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+
+    <div class="footer">
+      If this table is empty, your account may not have Cost Explorer rightsizing enabled yet,
+      or there are no current recommendations.
+    </div>
+  </div>
+
+  <script>
+const JSON_URL = "/projects/ec2-rightsizing/latest.json"; // single source of truth
+
+function normNumber(x){
+  if (x == null) return 0;
+  if (typeof x === "number") return x;
+  const f = parseFloat(x);
+  return isNaN(f) ? 0 : f;
+}
+
+function normalizeRows(data){
+  const date = (data.generated_at || "").slice(0,10);
+  const recs = Array.isArray(data.recommendations) ? data.recommendations : [];
+  const rows = [];
+
+  for (const r of recs){
+    // ----- Cost Explorer / Synthetic (uses RightsizingType + Modify/Terminate details)
+    if (r.RightsizingType) {
+      const cur = r.CurrentInstance || {};
+      const curType = cur.ResourceDetails?.EC2ResourceDetails?.InstanceType || "";
+      const mod = r.ModifyRecommendationDetail;
+      const ter = r.TerminateRecommendationDetail;
+
+      let recommendedType = "";
+      let savings = 0;
+
+      if (mod) {
+        recommendedType = mod.TargetInstances?.[0]?.ResourceDetails?.EC2ResourceDetails?.InstanceType || "";
+        savings = normNumber(mod.EstimatedMonthlySavings?.Amount);
+      } else if (ter) {
+        recommendedType = "(terminate)";
+        savings = normNumber(ter.EstimatedMonthlySavings?.Amount);
+      }
+
+      rows.push({
+        Date: date,
+        Name: cur.InstanceName || "",
+        InstanceId: cur.ResourceId || "",
+        AZ: cur.ResourceDetails?.EC2ResourceDetails?.AvailabilityZone || "", // often empty in CE
+        CurrentType: curType,
+        RecommendedType: recommendedType,
+        State: "", // CE recs don't always include instance state
+        EstimatedMonthlySavings: savings
+      });
+      continue;
+    }
+
+    // ----- Compute Optimizer (different shape)
+    if (r.instanceArn || r.currentInstanceType || r.recommendationOptions){
+      const arn = r.instanceArn || "";
+      const instanceId = arn.split("/").pop() || "";
+      const recommendedType = r.recommendationOptions?.[0]?.instanceType || "";
+      const savings = normNumber(r.savingsOpportunity?.estimatedMonthlySavings?.value);
+
+      rows.push({
+        Date: date,
+        Name: r.instanceName || "",
+        InstanceId: instanceId,
+        AZ: r.currentPerformanceRisk || "", // no AZ in CO recs; leaving this column as misc/blank
+        CurrentType: r.currentInstanceType || "",
+        RecommendedType: recommendedType,
+        State: "", // CO recs don't carry state
+        EstimatedMonthlySavings: savings
+      });
+      continue;
+    }
+  }
+
+  return rows;
+}
+
+async function main(){
+  const status = document.getElementById('status');
+  const countEl = document.getElementById('count');
+  const totalEl = document.getElementById('total');
+  const tbody = document.querySelector('#t tbody');
+
+  try{
+    const res = await fetch(JSON_URL, { cache: 'no-store' });
+    if(!res.ok) throw new Error('HTTP ' + res.status);
+
+    const data = await res.json();
+    const rows = normalizeRows(data);
+
+    countEl.textContent = rows.length + ' items';
+    const total = rows.reduce((s,i)=> s + (i.EstimatedMonthlySavings||0), 0);
+    totalEl.textContent = 'Total savings: $' + total.toFixed(2) + '/mo';
+
+    tbody.innerHTML = '';
+    rows
+      .sort((a,b)=>(b.EstimatedMonthlySavings||0)-(a.EstimatedMonthlySavings||0))
+      .forEach(r => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+          <td>${r.Date || ''}</td>
+          <td>${r.Name || ''}</td>
+          <td>${r.InstanceId || ''}</td>
+          <td>${r.AZ || ''}</td>
+          <td>${r.CurrentType || ''}</td>
+          <td><span class="pill">${r.RecommendedType || ''}</span></td>
+          <td>${r.State || ''}</td>
+          <td>$${(r.EstimatedMonthlySavings || 0).toFixed(2)}</td>
+        `;
+        tbody.appendChild(tr);
+      });
+
+    const src = data.source || 'unknown';
+    status.textContent = rows.length ? `Loaded (${src})` : `No recommendations (${src})`;
+  }catch(err){
+    console.error(err);
+    status.textContent = 'Error loading data (check CloudFront path & S3 policy)';
+  }
+}
+main();
+</script>
+
+</body>
+</html>
